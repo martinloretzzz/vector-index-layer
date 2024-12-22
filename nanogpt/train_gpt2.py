@@ -19,14 +19,14 @@ from hellaswag import render_example, iterate_examples
 ENABLE_WANDB = True
 data_root = "fineweb/edu_fineweb10B"
 
-total_batch_size = 524288 # 262144 # 524288 # 2**19, ~0.5M, in number of tokens
-B = 8 # 64
+total_batch_size = 262144 # 262144 # 524288 # 2**19, ~0.5M, in number of tokens
+B = 16 # 64
 T = 1024 # sequence length
 
 max_lr = 6e-4
 min_lr = max_lr * 0.1
-warmup_steps = 715 # 715
-max_steps = 19073 # 19073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
+warmup_steps = 500 # 715
+max_steps = 5000 # 19073 steps is ~1 epoch, if data is 10B tokens and batch size 0.5M tokens
 
 model_type = "gpt2"
 load_pretrained = False
@@ -153,12 +153,21 @@ class GPT(nn.Module):
             x = block(x)
         # forward the final layernorm and the classifier
         x = self.transformer.ln_f(x)
-        logits = self.lm_head(x) # (B, T, vocab_size)
-        loss, acc = None, None
+
+        logits_lm_head = self.lm_head(x) # (B, T, vocab_size)
+
+        topk_logits, topk_indices = torch.topk(logits_lm_head, k=100, dim=-1)
+        logits = torch.full_like(logits_lm_head, fill_value=float("-inf"))
+        logits.scatter_(2, topk_indices, topk_logits)
+
+        loss, acc, loss_ref = None, None, None
         if targets is not None:
+            logits.scatter_(2, targets.unsqueeze(-1), logits_lm_head.gather(2, targets.unsqueeze(-1)))
+
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+            loss_ref = F.cross_entropy(logits_lm_head.detach().view(-1, logits_lm_head.size(-1)), targets.detach().view(-1))
             acc = (torch.argmax(logits, dim=-1) == targets).sum() / targets.numel()
-        return logits, loss, acc
+        return logits, loss, acc, loss_ref
 
     @classmethod
     def from_pretrained(cls, model_type):
@@ -391,9 +400,10 @@ print(x.shape, y.shape)
 x, y = train_loader.next_batch()
 x, y = x.to(device), y.to(device)
 with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-    logits, loss, acc = model(x, y)
+    logits, loss, acc, loss_ref = model(x, y)
 print(acc)
 
+# raise Error("Error")
 
 def get_lr(it):
     # 1) linear warmup for warmup_iters steps
@@ -415,7 +425,7 @@ if master_process:
     wandb.login(key=wandb_key)
     model_artifact_name = f"{project_name}-model-{random.randint(0, 1000)}"
     run = wandb.init(
-        project="nano-gpt",
+        project="vector-index",
         name=project_name,
         config={
             "model_type": model_type,
@@ -439,23 +449,25 @@ for step in range(start_step, max_steps):
         model.eval()
         val_loader.reset()
         with torch.no_grad():
-            val_loss_accum, val_acc_accum = 0.0, 0.0
+            val_loss_accum, val_loss_ref_accum, val_acc_accum = 0.0, 0.0, 0.0
             val_loss_steps = 20
             for _ in range(val_loss_steps):
                 x, y = val_loader.next_batch()
                 x, y = x.to(device), y.to(device)
                 with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                    logits, loss, acc = model(x, y)
+                    logits, loss, acc, loss_ref = model(x, y)
     
                 val_loss_accum += (loss / val_loss_steps).detach()
+                val_loss_ref_accum += (loss_ref / val_loss_steps).detach()
                 val_acc_accum += (acc / val_loss_steps).detach()
         if ddp:
             dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
+            dist.all_reduce(val_loss_ref_accum, op=dist.ReduceOp.AVG)
             dist.all_reduce(val_acc_accum, op=dist.ReduceOp.AVG)
 
         if master_process:
-            print(f"validation loss: {val_loss_accum.item():.4f} | acc: {val_acc_accum.item():.2f}")
-            run.log({"step": step, "val/loss": val_loss_accum.item(), "val/acc": val_acc_accum.item()})
+            print(f"validation loss: {val_loss_ref_accum.item():.4f} | acc: {val_acc_accum.item():.2f} | loss topk: {val_loss_accum.item():.2f}")
+            run.log({"step": step, "val/loss": val_loss_ref_accum.item(), "val/acc": val_acc_accum.item(), "val/loss_topk": val_loss_accum.item()})
 
             if step > 0 and (step % 5000 == 0 or last_step):
                 # optionally write model checkpoints
@@ -490,7 +502,7 @@ for step in range(start_step, max_steps):
             # get the logits
             with torch.no_grad():
                 with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                    logits, _, __ = model(tokens)
+                    logits, _, __, ___ = model(tokens)
                 pred_norm = get_most_likely_row(tokens, mask, logits)
             num_total += 1
             num_correct_norm += int(pred_norm == label)
@@ -523,7 +535,7 @@ for step in range(start_step, max_steps):
             # forward the model to get the logits
             with torch.no_grad():
                 with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                    logits, _, __ = model(xgen) # (B, T, vocab_size)
+                    logits, _, __, ___ = model(xgen) # (B, T, vocab_size)
                 # take the logits at the last position
                 logits = logits[:, -1, :]# (B, vocab_size)
                 # get the probabilities
@@ -548,7 +560,7 @@ for step in range(start_step, max_steps):
     # do one step of the optimization
     model.train()
     optimizer.zero_grad()
-    loss_accum, acc_accum = 0.0, 0.0
+    loss_accum, loss_ref_accum, acc_accum = 0.0, 0.0, 0.0
     for micro_step in range(grad_accum_steps):
         x, y = train_loader.next_batch()
         x, y = x.to(device), y.to(device)
@@ -556,17 +568,19 @@ for step in range(start_step, max_steps):
         if ddp:
             model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
         with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-            logits, loss, acc = model(x, y)
+            logits, loss, acc, loss_ref = model(x, y)
         # we have to scale the loss to account for gradient accumulation,
         # because the gradients just add on each successive backward().
         # addition of gradients corresponds to a SUM in the objective, but
         # instead of a SUM we want MEAN. Scale the loss here so it comes out right
         loss = loss / grad_accum_steps
         loss_accum += loss.detach()
+        loss_ref_accum += (loss_ref / grad_accum_steps).detach()
         acc_accum += acc / grad_accum_steps
         loss.backward()
     if ddp:
         dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
+        dist.all_reduce(loss_ref_accum, op=dist.ReduceOp.AVG)
         dist.all_reduce(acc_accum, op=dist.ReduceOp.AVG)
 
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -583,8 +597,8 @@ for step in range(start_step, max_steps):
     tokens_per_sec = tokens_processed / dt
     if master_process:
         if step % 10 == 0:
-            print(f"step {step:5d} | loss: {loss_accum.item():.6f} | acc: {acc_accum.item():.6f}  | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
-        run.log({"step": step, "loss": loss_accum.item(), "acc": acc_accum.item(), "lr":lr, "norm":norm, "dt":1000*dt, "tokens_per_sec": tokens_per_sec })
+            print(f"step {step:5d} | loss: {loss_ref_accum.item():.6f} | loss topk: {loss_accum.item():.6f} | acc: {acc_accum.item():.6f}  | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+        run.log({"step": step, "loss": loss_ref_accum.item(), "loss_topk": loss_accum.item(), "acc": acc_accum.item(), "lr":lr, "norm":norm, "dt":1000*dt, "tokens_per_sec": tokens_per_sec })
 
 if master_process:
     run.finish()
